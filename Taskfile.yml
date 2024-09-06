@@ -1,0 +1,228 @@
+version: '3'
+
+vars:
+  K8S_EXTERNAL_IP:
+    sh: ifconfig > /dev/null 2>&1 && ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1 || hostname -I | cut -d" " -f 1
+  METALLB_ADDRS: 172.18.250.200-172.18.250.250 # docker network inspect -f '{{.IPAM.Config}}' kind
+  ARGOCD_VERSION: "v2.12.2"
+  ARGO_ROLLOUT_VERSION: "v1.7.2"
+  ARGO_WORKFLOWS_VERSION: "v3.5.10"
+  ARGO_CLI_VERSION: "v3.5.10"
+  CROSSPLANE_VERSION: "v1.16"
+
+tasks:
+
+  default:
+    desc: "Main task"
+    deps: 
+      - task: argoworkflows
+
+  kind-cluster:
+    desc: Create the kubernet cluster using Kind
+    run: once 
+    cmds:
+      - |-
+        kind get clusters -q | grep -w argo  || \
+        cat <<EOT | kind create cluster --config -
+        apiVersion: kind.x-k8s.io/v1alpha4
+        kind: Cluster
+        name: argo
+        nodes:
+        - role: control-plane
+          kubeadmConfigPatches:
+          - |
+            kind: InitConfiguration
+            nodeRegistration:
+              kubeletExtraArgs:
+                node-labels: "ingress-ready=true"
+          extraPortMappings:
+          - containerPort: 80
+            hostPort: 80
+            protocol: TCP
+            listenAddress: "{{.K8S_EXTERNAL_IP}}"
+          - containerPort: 443
+            hostPort: 443
+            protocol: TCP
+            listenAddress: "{{.K8S_EXTERNAL_IP}}"
+        - role: worker
+          labels:
+            nodeType: worker
+        - role: worker
+          labels:
+            nodeType: worker
+        EOT
+
+  metallb:
+    desc: Install bare metal load-balancer for Kubernetes
+    run: once
+    deps:
+      - task: kind-cluster
+    cmds:
+      - kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+      - kubectl -n metallb-system wait --for=condition=Ready pods --all --timeout=90s
+      - |-
+        cat  <<EOT | kubectl apply -f -
+        apiVersion: metallb.io/v1beta1
+        kind: IPAddressPool
+        metadata:
+          name: first-pool
+          namespace: metallb-system
+        spec:
+          addresses:
+            - {{.METALLB_ADDRS}}
+          autoAssign: true
+
+        ---
+        apiVersion: metallb.io/v1beta1
+        kind: L2Advertisement
+        metadata:
+          name: default
+          namespace: metallb-system
+        spec:
+          ipAddressPools:
+            - first-pool
+        EOT
+
+  ingress:
+    desc: Deploy NGINX Ingress Controller
+    deps:
+      - task: metallb
+    cmds:
+      - kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+      - |-
+        kubectl wait --namespace ingress-nginx \
+        --for=condition=ready pod \
+        --selector=app.kubernetes.io/component=controller \
+        --timeout=90s
+
+  argocd:
+    desc: Install ArgoCD
+    run: once
+    deps:
+      - task: ingress
+    cmds:
+      - kubectl get ns | grep ^'argocd ' > /dev/null 2>&1 && echo Namespace argocd already exits || kubectl create ns argocd
+      - kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/{{.ARGOCD_VERSION}}/manifests/install.yaml
+      - kubectl wait --namespace argocd --for=condition=ready pod --selector=app.kubernetes.io/name=argocd-repo-server --timeout=90s
+      - |-
+        cat <<EOT | kubectl apply -n argocd -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argocd-server-http-ingress
+          namespace: argocd
+          annotations:
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+        spec:
+          ingressClassName: "nginx"
+          rules:
+          - http:
+              paths:
+              - pathType: Prefix
+                path: /
+                backend:
+                  service:
+                    name: argocd-server
+                    port: 
+                      name: https
+            host: argocd.{{.K8S_EXTERNAL_IP}}.nip.io
+          tls:
+          - hosts:
+            - argocd.{{.K8S_EXTERNAL_IP}}.nip.io
+            secretName: argocd-secret
+        EOT
+      - echo "Admin pwd is `kubectl -n argocd get secrets argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d`"
+      - echo "ArgoCD gui is avaliable at http://argocd.{{.K8S_EXTERNAL_IP}}.nip.io"
+
+  argocli:
+    desc: Install Argo CLI
+    run: once
+    deps:
+      - task: argocd
+    cmds:
+      - echo "Getting argo-{{.ARGOCLI}} ..."
+      - curl -sLO https://github.com/argoproj/argo-workflows/releases/download/{{.ARGO_CLI_VERSION}}/argo-{{.ARGOCLI}}.gz
+      - gunzip argo-{{.ARGOCLI}}.gz
+      - sudo install -o root -g `id -gn root` -m 0755 argo-{{.ARGOCLI}} /usr/local/bin/argo
+      - rm -f argo-{{.ARGOCLI}}
+      - argo version
+    vars:
+      ARGOCLI:
+        sh: echo `uname -s | tr '[:upper:]' '[:lower:]'`-`uname -m | sed 's/x86_64/amd64/'`
+
+  argorollouts:
+    desc: Install Argo Rollouts
+    run: once
+    deps:
+      - task: argocli
+    cmds:
+      - kubectl get ns | grep ^'argo-rollouts ' > /dev/null 2>&1 && echo Namespace argo-rollouts already exits || kubectl create ns argo-rollouts
+      - kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/download/{{.ARGO_ROLLOUT_VERSION}}/install.yaml
+      - kubectl wait --namespace argo-rollouts --for=condition=ready pod --selector=app.kubernetes.io/name=argo-rollouts --timeout=90s
+
+  argoworkflows:
+    desc: Install Argo Workflows
+    run: once
+    deps:
+      - task: argorollouts
+    cmds:
+      - kubectl get ns | grep -w ^'argo ' > /dev/null 2>&1 && echo Namespace argo already exits || kubectl create ns argo
+      - kubectl apply -n argo -f https://github.com/argoproj/argo-workflows/releases/download/{{.ARGO_WORKFLOWS_VERSION}}/quick-start-minimal.yaml
+      - kubectl wait --namespace argo --for=condition=ready pod --selector=app=minio --timeout=90s
+      - kubectl wait --namespace argo --for=condition=ready pod --selector=app=httpbin --timeout=90s
+      - kubectl wait --namespace argo --for=condition=ready pod --selector=app=argo-server --timeout=120s
+      - |-
+        cat <<EOT | kubectl apply -n argo -f -
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: argo-worflow-ingress
+          namespace: argo
+          annotations:
+            nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+            nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+        spec:
+          ingressClassName: "nginx"
+          rules:
+          - http:
+              paths:
+              - pathType: Prefix
+                path: /
+                backend:
+                  service:
+                    name: argo-server
+                    port: 
+                      name: web
+            host: argoworkflow.{{.K8S_EXTERNAL_IP}}.nip.io
+          tls:
+          - hosts:
+            - argoworkflow.{{.K8S_EXTERNAL_IP}}.nip.io
+            secretName: argoworkflow-secret
+        EOT
+      - echo "Argo Workflow gui is avaliable at https://argoworkflow.{{.K8S_EXTERNAL_IP}}.nip.io"
+
+  crossplane:
+    desc: Install Crossplane
+    run: once
+    deps:
+      - task: kind-cluster
+    cmds:
+      - helm repo add crossplane-stable https://charts.crossplane.io/stable
+      - helm repo update
+      - |-
+        helm upgrade --install crossplane \
+        --namespace crossplane-system \
+        --create-namespace crossplane-stable/crossplane \
+        --version {{.CROSSPLANE_VERSION}}
+      - kubectl wait -n crossplane-system --for=condition=ready pod --selector=app.kubernetes.io/name=crossplane --timeout=90s
+
+  destroy:
+    desc: Destroy the kubernet cluster
+    run: once
+    prompt: This will delete the Kind cluster. Do you want to continue?
+    cmds:
+      - kind delete cluster --name argo
+      - kind get clusters
+
+
