@@ -3,7 +3,6 @@ version: '3'
 vars:
   K8S_EXTERNAL_IP:
     sh: ifconfig > /dev/null 2>&1 && ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1 || hostname -I | cut -d" " -f 1
-  METALLB_ADDRS: 172.18.250.200-172.18.250.250 # docker network inspect -f '{{.IPAM.Config}}' kind
   ARGOCD_VERSION: "v2.12.2"
   ARGO_ROLLOUT_VERSION: "v1.7.2"
   ARGO_WORKFLOWS_VERSION: "v3.5.10"
@@ -52,43 +51,12 @@ tasks:
             nodeType: worker
         EOT
 
-  metallb:
-    desc: Install bare metal load-balancer for Kubernetes
-    run: once
-    deps:
-      - task: kind-cluster
-    cmds:
-      - kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
-      - kubectl -n metallb-system wait --for=condition=Ready pods --all --timeout=90s
-      - |-
-        cat  <<EOT | kubectl apply -f -
-        apiVersion: metallb.io/v1beta1
-        kind: IPAddressPool
-        metadata:
-          name: first-pool
-          namespace: metallb-system
-        spec:
-          addresses:
-            - {{.METALLB_ADDRS}}
-          autoAssign: true
-
-        ---
-        apiVersion: metallb.io/v1beta1
-        kind: L2Advertisement
-        metadata:
-          name: default
-          namespace: metallb-system
-        spec:
-          ipAddressPools:
-            - first-pool
-        EOT
-
   ingress:
     desc: Deploy NGINX Ingress Controller
     deps:
-      - task: metallb
+      - task: kind-cluster
     cmds:
-      - kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/cloud/deploy.yaml
+      - kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
       - |-
         kubectl wait --namespace ingress-nginx \
         --for=condition=ready pod \
