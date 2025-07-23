@@ -3,11 +3,11 @@ version: '3'
 vars:
   K8S_EXTERNAL_IP:
     sh: ifconfig > /dev/null 2>&1 && ifconfig | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | head -1 || hostname -I | cut -d" " -f 1
-  ARGOCD_VERSION: "v2.12.2"
-  ARGO_ROLLOUT_VERSION: "v1.7.2"
+  ARGOCD_VERSION: "v3.0.11"
+  ARGO_ROLLOUT_VERSION: "v1.8.3"
   ARGO_WORKFLOWS_VERSION: "v3.5.10"
-  ARGO_CLI_VERSION: "v3.5.10"
-  CROSSPLANE_VERSION: "v1.16"
+  ARGO_CLI_VERSION: "v3.6.10"
+  CROSSPLANE_VERSION: "v1.20"
 
 tasks:
 
@@ -70,7 +70,18 @@ tasks:
       - task: ingress
     cmds:
       - kubectl get ns | grep ^'argocd ' > /dev/null 2>&1 && echo Namespace argocd already exits || kubectl create ns argocd
-      - kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/{{.ARGOCD_VERSION}}/manifests/install.yaml
+      - |-
+        cat <<EOT > kustomization.yaml
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+
+        resources:
+          - https://raw.githubusercontent.com/argoproj/argo-cd/{{.ARGOCD_VERSION}}/manifests/install.yaml
+
+        patches:
+          - path: ./rollout-extension-patch.yaml
+        EOT
+      - kustomize build . | kubectl apply -n argocd -f -
       - kubectl wait --namespace argocd --for=condition=ready pod --selector=app.kubernetes.io/name=argocd-repo-server --timeout=90s
       - |-
         cat <<EOT | kubectl apply -n argocd -f -
@@ -119,11 +130,24 @@ tasks:
       ARGOCLI:
         sh: echo `uname -s | tr '[:upper:]' '[:lower:]'`-`uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/'`
 
+  argocdcli:
+    desc: Install ArgoCD CLI
+    run: once
+    deps:
+      - task: argocli
+    cmds:
+      - curl -sSL -o argocd-{{.ARGOCLI}} https://github.com/argoproj/argo-cd/releases/download/{{.ARGOCD_VERSION}}/argocd-{{.ARGOCLI}}
+      - sudo install -m 0755 argocd-{{.ARGOCLI}} /usr/local/bin/argocd
+      - rm argocd-{{.ARGOCLI}}
+    vars:
+      ARGOCLI:
+        sh: echo `uname -s | tr '[:upper:]' '[:lower:]'`-`uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/'`
+
   argorollouts:
     desc: Install Argo Rollouts
     run: once
     deps:
-      - task: argocli
+      - task: argocdcli
     cmds:
       - kubectl get ns | grep ^'argo-rollouts ' > /dev/null 2>&1 && echo Namespace argo-rollouts already exits || kubectl create ns argo-rollouts
       - kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/download/{{.ARGO_ROLLOUT_VERSION}}/install.yaml
@@ -192,5 +216,7 @@ tasks:
     cmds:
       - kind delete cluster --name argo
       - kind get clusters
+      - rm -f kustomization.yaml
+
 
 

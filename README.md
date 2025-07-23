@@ -24,3 +24,11 @@ task: Available tasks for this project:
 * kind-cluster:        Create the kubernet cluster using Kind
 * metallb:             Install bare metal load-balancer for Kubernetes
 ```
+
+## Register kind cluster into ArgoCD
+
+```bash
+$ argocd login <argocd address>
+$ argocd cluster add kind-argo --in-cluster --insecure --yes --upsert --grpc-web
+```
+
